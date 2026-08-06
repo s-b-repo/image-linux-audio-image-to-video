@@ -1,72 +1,81 @@
-import gi
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, GObject, GLib
+#!/usr/bin/env python3
+"""GTK3 GUI that combines a still image with an audio track into an mp4
+by looping the image for the length of the audio. Shells out to ffmpeg."""
+
 import os
+import shutil
 import subprocess
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib  # noqa: E402
+
 
 class AddAudioGUI:
     def __init__(self):
-        # Create the main window
         self.window = Gtk.Window(title="Add Audio to Image")
         self.window.set_border_width(10)
-        self.window.set_default_size(400, 200)
+        self.window.set_default_size(420, 220)
+        self.window.connect("destroy", Gtk.main_quit)
 
-        # Create a vertical box to hold the image and audio widgets
         vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
-        # Create a horizontal box to hold the image label and image file chooser button
+        # Image row
         hbox_image = Gtk.Box(spacing=6)
-        image_label = Gtk.Label("Image:")
-        self.image_button = Gtk.FileChooserButton()
-        self.image_button.set_title("Choose an image file")
-        hbox_image.pack_start(image_label, False, False, 0)
+        hbox_image.pack_start(Gtk.Label(label="Image:"), False, False, 0)
+        self.image_button = Gtk.FileChooserButton(title="Choose an image file")
         hbox_image.pack_start(self.image_button, True, True, 0)
 
-        # Create a horizontal box to hold the audio label and audio file chooser button
+        # Audio row
         hbox_audio = Gtk.Box(spacing=6)
-        audio_label = Gtk.Label("Audio:")
-        self.audio_button = Gtk.FileChooserButton()
-        self.audio_button.set_title("Choose an audio file")
-        hbox_audio.pack_start(audio_label, False, False, 0)
+        hbox_audio.pack_start(Gtk.Label(label="Audio:"), False, False, 0)
+        self.audio_button = Gtk.FileChooserButton(title="Choose an audio file")
         hbox_audio.pack_start(self.audio_button, True, True, 0)
 
-                # Create a horizontal box to hold the output label and output file chooser button
+        # Output row
         hbox_output = Gtk.Box(spacing=6)
-        output_label = Gtk.Label("Output:")
-        self.output_button = Gtk.FileChooserButton()
-        self.output_button.set_title("Choose an output file")
+        hbox_output.pack_start(Gtk.Label(label="Output:"), False, False, 0)
+        self.output_button = Gtk.FileChooserButton(
+            title="Choose an output file",
+            action=Gtk.FileChooserAction.SAVE,
+        )
         self.output_button.set_current_name("output.mp4")
-        hbox_output.pack_start(output_label, False, False, 0)
         hbox_output.pack_start(self.output_button, True, True, 0)
 
-        # Create a horizontal box to hold the create video button
+        # Create button
         hbox_create = Gtk.Box(spacing=6)
         create_button = Gtk.Button.new_with_label("Create Video")
         create_button.connect("clicked", self.on_create_clicked)
         hbox_create.pack_start(create_button, True, True, 0)
 
-                # Create a horizontal box to hold the progress bar
+        # Progress bar
         hbox_progress = Gtk.Box(spacing=6)
         self.progress_bar = Gtk.ProgressBar()
         hbox_progress.pack_start(self.progress_bar, True, True, 0)
 
-        # Add the image, audio, and output boxes to the main vertical box
-        vbox.pack_start(hbox_image, True, True, 0)
-        vbox.pack_start(hbox_audio, True, True, 0)
-        vbox.pack_start(hbox_output, True, True, 0)
-        vbox.pack_start(hbox_create, True, True, 0)
-        vbox.pack_start(hbox_progress, True, True, 0)
+        for hbox in (hbox_image, hbox_audio, hbox_output, hbox_create, hbox_progress):
+            vbox.pack_start(hbox, True, True, 0)
 
-        # Add the vertical box to the main window
         self.window.add(vbox)
+        self.window.show_all()
 
-    def on_create_clicked(self, widget):
-        # Get the image and audio file names from the file chooser buttons
+        self.ffmpeg_process = None
+        self.timeout_id = None
+        self.audio_duration = None  # populated per-run via ffprobe
+
+    # -- actions --
+
+    def on_create_clicked(self, _widget):
         image_file = self.image_button.get_filename()
         audio_file = self.audio_button.get_filename()
         output_file = self.output_button.get_filename()
 
-        # Check if the input files exist
+        # None filenames happen if the user hits Create before picking one.
+        for name, path in (("Image", image_file), ("Audio", audio_file), ("Output", output_file)):
+            if not path:
+                self.show_error_message(f"{name} file not selected.")
+                return
+
         if not os.path.exists(image_file):
             self.show_error_message("Image file not found")
             return
@@ -74,64 +83,139 @@ class AddAudioGUI:
             self.show_error_message("Audio file not found")
             return
 
-        # Check if the output file can be written
-        try:
-            open(output_file, "w").close()
-        except:
-            self.show_error_message("Unable to write to output file")
+        # Check we can write to the output directory WITHOUT truncating the
+        # target itself — the old code did `open(output_file, "w").close()`
+        # which nuked any existing file before ffmpeg saw it.
+        output_dir = os.path.dirname(os.path.abspath(output_file))
+        if not os.access(output_dir, os.W_OK):
+            self.show_error_message(f"Output directory not writable: {output_dir}")
             return
 
-        # Use ffmpeg to combine the image and audio into a video
-        command = (f"ffmpeg -loop 1 -i {image_file} -i {audio_file} "
-                   f"-c:v libx264 -tune stillimage -c:a aac -b:a 192k "
-                                      f"-pix_fmt yuv420p -shortest {output_file}")
-        self.ffmpeg_process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if not shutil.which("ffmpeg"):
+            self.show_error_message("ffmpeg not found on PATH.")
+            return
 
-        # Update the progress bar while ffmpeg is running
+        self.audio_duration = probe_duration(audio_file)
+
+        # Build the command as an argv list — no shell, so filenames with
+        # spaces / quotes / ; can't inject anything into a shell parse.
+        argv = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", image_file,
+            "-i", audio_file,
+            "-c:v", "libx264", "-tune", "stillimage",
+            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p", "-shortest",
+            output_file,
+        ]
+        self.ffmpeg_process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
         self.progress_bar.set_fraction(0.0)
         self.window.set_sensitive(False)
-        self.timeout_id = GLib.timeout_add(100, self.update_progress_bar)
+        self.timeout_id = GLib.timeout_add(200, self.update_progress_bar)
 
     def update_progress_bar(self):
-        # Update the progress bar based on the output of the ffmpeg command
-        line = self.ffmpeg_process.stdout.readline()
-        if not line:
-            return True
+        if self.ffmpeg_process is None:
+            return False
 
-        # Parse the output of ffmpeg to get the progress
-        if "time=" in line:
+        # Non-blocking check: has ffmpeg exited?
+        rc = self.ffmpeg_process.poll()
+
+        # Drain whatever's available on stdout, one line at a time. readline
+        # on a pipe would block if ffmpeg had nothing to say; we mitigate
+        # by only pulling one line per tick and letting the next tick get
+        # the next one.
+        line = self.ffmpeg_process.stdout.readline()
+        if line and "time=" in line and self.audio_duration:
             try:
-                time = line.split("time=")[1].split(" ")[0]
+                time = line.split("time=", 1)[1].split(" ", 1)[0]
                 hours, minutes, seconds = map(float, time.split(":"))
-                duration = 3600 * hours + 60 * minutes + seconds
-                self.progress_bar.set_fraction(duration / 100.0)
-            except:
+                elapsed = 3600 * hours + 60 * minutes + seconds
+                self.progress_bar.set_fraction(min(1.0, elapsed / self.audio_duration))
+            except (ValueError, IndexError):
                 pass
 
+        if rc is not None:
+            # Drain any remaining output.
+            try:
+                self.ffmpeg_process.stdout.read()
+            except Exception:
+                pass
+            self.on_ffmpeg_complete(rc)
+            return False  # stop the GLib timeout
         return True
 
-    def show_error_message(self, message):
-        # Display an error message dialog
-        message_dialog = Gtk.MessageDialog(self.window, 0, Gtk.MessageType.ERROR, Gtk.ButtonsType.OK, "Error")
-        message_dialog.format_secondary_text(message)
-        message_dialog.run()
-        message_dialog.destroy()
-
     def on_ffmpeg_complete(self, retcode):
-        # Called when ffmpeg has finished running
         self.window.set_sensitive(True)
         self.timeout_id = None
         self.ffmpeg_process = None
         if retcode == 0:
             self.progress_bar.set_fraction(1.0)
-            self.show_message_dialog("Video Created", "The video has been created and saved to the specified file.")
+            self.show_message_dialog(
+                "Video Created",
+                "The video has been created and saved to the specified file.",
+            )
         else:
-            self.show_error_message("Error creating video")
+            self.show_error_message(f"ffmpeg exited with code {retcode}")
+
+    # -- dialogs --
+
+    def show_error_message(self, message):
+        d = Gtk.MessageDialog(
+            transient_for=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text="Error",
+        )
+        d.format_secondary_text(message)
+        d.run()
+        d.destroy()
+
+    def show_message_dialog(self, title, message):
+        d = Gtk.MessageDialog(
+            transient_for=self.window,
+            flags=0,
+            message_type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            text=title,
+        )
+        d.format_secondary_text(message)
+        d.run()
+        d.destroy()
+
+
+def probe_duration(path):
+    """Ask ffprobe for the media duration in seconds. Returns None if the
+    call fails or ffprobe isn't installed."""
+    if not shutil.which("ffprobe"):
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+        )
+        return float(out.strip())
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+
 
 def main():
     AddAudioGUI()
     Gtk.main()
 
+
 if __name__ == "__main__":
     main()
-
